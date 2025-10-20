@@ -2,6 +2,8 @@ import { expect, test } from "vitest";
 import { expressionN } from "../src/index";
 import invariant from "tiny-invariant";
 
+// right now the only expressions are identifiers
+
 test("expression", () => {
   const run = expressionN.run("test");
 
@@ -9,12 +11,8 @@ test("expression", () => {
   invariant(!run.isError);
 
   expect(run.result).toEqual({
-    type: "expression",
+    name: "test",
+    type: "identifier",
     index: 0,
-    expression: {
-      name: "test",
-      type: "identifier",
-      index: 0,
-    },
   });
 });

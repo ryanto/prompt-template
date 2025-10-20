@@ -12,13 +12,9 @@ test("interpolation", () => {
     type: "interpolation",
     index: 0,
     expression: {
-      type: "expression",
+      type: "identifier",
+      name: "test",
       index: 2,
-      expression: {
-        name: "test",
-        type: "identifier",
-        index: 2,
-      },
     },
   });
 });
@@ -30,4 +26,22 @@ test("unclosed interpolation", () => {
   invariant(run.isError);
 
   expect(run.error).toEqual("Unclosed interpolation");
+});
+
+test("missing expression", () => {
+  const run = interpolationN.run("{{}}");
+
+  expect(run.isError).toBe(true);
+  invariant(run.isError);
+
+  expect(run.error).toEqual("Expected identifier");
+});
+
+test("unclosed and missing expression", () => {
+  const run = interpolationN.run("{{");
+
+  expect(run.isError).toBe(true);
+  invariant(run.isError);
+
+  expect(run.error).toEqual("Expected identifier");
 });

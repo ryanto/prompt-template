@@ -4,14 +4,14 @@ import {
   everyCharUntil,
   lookAhead,
   many,
-  optionalWhitespace,
   whitespace,
   sequenceOf,
   str,
   fail,
   succeedWith,
-  withData,
   regex,
+  recursiveParser,
+  Parser,
 } from "arcsecond";
 
 type Identifier = {
@@ -20,11 +20,9 @@ type Identifier = {
   index: number;
 };
 
-type Expression = {
-  type: "expression";
-  expression: Identifier;
-  index: number;
-};
+// TODO: Update Expression to be Idnetifier | BinaryExpression
+// In the future BinaryExpression will be (and a b) type statements
+type Expression = Identifier;
 
 type Interpolation = {
   type: "interpolation";
@@ -46,19 +44,12 @@ type Conditional = {
   index: number;
 };
 
-// type If = {
-//       type: "if";
-//       condition: string; // identifier
-//       consequent: Node[]; // nodes until {{ else }} or {{ end }}
-//       alternate?: Node[]; // nodes between {{ else }} and {{ end }}
-//     };
-
 type Node = Identifier | Expression | Conditional | Text | Interpolation;
 
 // tokens
 const open = str("{{");
 const close = str("}}");
-const ows = optionalWhitespace;
+const ws = whitespace;
 
 const RESERVED = new Set(["if", "else", "end"]);
 
@@ -78,22 +69,20 @@ export const identifierN = sequenceOf([
     index: index - result.length,
   }));
 
-// TODO: im not sure this is needed, it's a nice wrapper though?
-export const expressionN = identifierN.mapFromData<Expression>(
-  ({ result }) => ({
-    type: "expression",
-    expression: result,
-    index: result.index,
-  }),
-);
+// TODO: in the future this will be a choice between an identifier and
+//       binary expression
+export const expressionN = identifierN;
 
-export const interpolationN = sequenceOf([open, ows, expressionN, ows, close])
-  .mapFromData<Node>(({ result: [, , expression] }) => ({
+export const interpolationN = open.chain(() =>
+  sequenceOf([
+    identifierN,
+    close.errorMap(() => "Unclosed interpolation"),
+  ]).mapFromData<Interpolation>(({ result: [identifier] }) => ({
     type: "interpolation",
-    index: expression.index - 2,
-    expression,
-  }))
-  .errorMap(() => "Unclosed interpolation");
+    index: identifier.index - 2,
+    expression: identifier,
+  })),
+);
 
 export const textN = everyCharUntil(choice([lookAhead(open), endOfInput]))
   .chain((s) =>
@@ -107,73 +96,134 @@ export const textN = everyCharUntil(choice([lookAhead(open), endOfInput]))
     index: index - result.length,
   }));
 
-// Not sure how to test this?
-const bodyNode = choice([
-  lookAhead(sequenceOf([open, ows, str("end"), ows, close])).chain(() =>
-    fail("stop"),
-  ),
-  lookAhead(open).chain(() => interpolationN),
-  textN,
-]);
+// {{ if <expression> }}
+const ifBeginTokens = [open, str("if"), ws];
+const ifBeginP = sequenceOf(ifBeginTokens);
 
-// {{ if <identifier> }}
-const ifStartP = sequenceOf([
-  open,
-  ows,
-  str("if"),
-  whitespace,
-  expressionN,
-  ows,
-  close.errorMap(() => "Unclosed if tag"),
-]).map<Expression>(([, , , , expression]) => expression);
+const ifConditionP1 = sequenceOf([
+  ...ifBeginTokens,
+  expressionN.errorMap(() => "Missing or invalid if expression"),
+  close.errorMap(() => "Unclosed if"),
+]).map<Expression>(([, , , expression]) => expression);
 
-// {{ else }} / {{ end }}
-// const elseT = sequenceOf([
-//   open,
-//   ows,
-//   str("else"),
-//   ows,
-//   close.errorMap(() => "Unclosed end tag"),
-// ]).map(() => null);
+const endBeginTokens = [open, str("end")];
+const endP = sequenceOf([...endBeginTokens, close]);
 
-const endP = sequenceOf([
-  open,
-  ows,
-  str("end"),
-  ows,
-  close.errorMap(() => "Unclosed end tag"),
-]).map(() => null);
+const bodyN: Parser<Node> = recursiveParser(() =>
+  choice([
+    lookAhead(endP).chain(() => fail("Unexpected end")),
+    lookAhead(ifBeginP).chain(() => ifBlockN),
+    lookAhead(open).chain(() => interpolationN),
+    textN,
+  ]),
+);
 
-export const ifBlockN = ifStartP.chain((expression) => {
-  if (!expression) return fail("Missing expression in if tag");
+export const ifBlockN = ifConditionP1.chain((expression) => {
+  if (!expression) return fail("Missing or invalid if expression");
 
-  return many(bodyNode).chain((consequent) =>
-    endP.map(() => ({
-      type: "conditional",
-      index: 0,
-      condition: expression,
-      consequent,
-    })),
+  return many(bodyN).chain((consequent) =>
+    endP
+      .errorMap(() => "Missing end tag after if block")
+      .map<Conditional>(() => ({
+        type: "conditional",
+        index: expression.index - 5, // 5 characters before the expression, -> {{if\s
+        condition: expression,
+        consequent: consequent ?? [],
+      })),
   );
 });
 
-// Main program here
-
-const node = choice([
-  lookAhead(sequenceOf([open, ows, str("if")])).chain(() => ifBlockN),
-  lookAhead(open).chain(() => interpolationN),
-  textN,
-]);
-
-const templateParser = many(node).chain((nodes) =>
-  endOfInput.map(() => nodes).errorMap(() => "Unexpected end of template"),
+export const templateParser: Parser<Node[]> = recursiveParser(() =>
+  choice([
+    endOfInput.map(() => []),
+    sequenceOf([bodyN, templateParser]).map(([first, rest]) => [
+      first,
+      ...rest,
+    ]),
+  ]),
 );
 
-function getValue(data: any, key: string) {
-  return key.split(".").reduce((obj, k) => obj?.[k], data);
+// --- runner ---
+
+type Data = {
+  [key: string]: string | boolean;
+};
+
+class RuntimeError extends Error {
+  index: number;
+
+  constructor(message: string, index: number) {
+    super(message);
+    this.message = message;
+    this.index = index;
+  }
 }
 
-function hasValue(data: any, key: string) {
+class ParseError extends Error {
+  index: number;
+
+  constructor(message: string, index: number) {
+    super(message);
+    this.message = message;
+    this.index = index;
+  }
+}
+
+export function run(template: string, data: Data): string {
+  const ast = templateParser.run(template);
+  if (ast.isError) {
+    throw new ParseError(ast.error, ast.index);
+  }
+
+  if (!ast.result) {
+    throw new ParseError("Could not generate program from template", 0);
+  }
+
+  const result = processNodes(ast.result, data);
+
+  return result;
+}
+
+type ErrorResult = {
+  isError: true;
+  index: number;
+  error: string;
+};
+type SuccessResult = {
+  isError: false;
+  output: string;
+};
+type SafeResult = ErrorResult | SuccessResult;
+
+export function safeRun(template: string, data: Data): SafeResult {
+  try {
+    const output = run(template, data);
+    return {
+      isError: false,
+      output,
+    };
+  } catch (e: unknown) {
+    if (e instanceof ParseError) {
+      return {
+        isError: true,
+        error: e.message,
+        index: e.index,
+      };
+    }
+
+    if (e instanceof RuntimeError) {
+      return {
+        isError: true,
+        error: e.message,
+        index: e.index,
+      };
+    }
+
+    throw e;
+  }
+}
+
+function hasKey(data: any, key: string) {
   const result = key.split(".").reduce(
     ([exists, obj], k) => {
       if (!exists) return [false, obj];
@@ -188,16 +238,25 @@ function hasValue(data: any, key: string) {
   return result[0];
 }
 
-const processNodes = (nodes: Node[], data: any): string => {
+function getValue(data: Data, key: string) {
+  return data[key];
+  // return key.split(".").reduce<keyof Data>((obj, k) => obj[k], data);
+}
+
+const processNodes = (nodes: Node[], data: Data): string => {
   return nodes
     .map((part) => {
       if (part.type === "text") {
         return part.text;
       } else if (part.type === "interpolation") {
-        const key = part.expression.expression.name;
+        const key = part.expression.name;
+        if (!hasKey(data, key)) {
+          throw new RuntimeError(`Missing value for "{{${key}}}"`, part.index);
+        }
+
         return getValue(data, key);
       } else if (part.type === "conditional") {
-        const key = part.condition.expression.name;
+        const key = part.condition.name;
         const conditionValue = getValue(data, key);
         if (conditionValue) {
           return processNodes(part.consequent, data);
@@ -210,14 +269,3 @@ const processNodes = (nodes: Node[], data: any): string => {
     })
     .join("");
 };
-
-const interpolator = templateParser.mapFromData(({ result: parts, data }) => {
-  // this is the full ast
-  console.log(JSON.stringify(parts, null, 2));
-
-  const result = parts ? processNodes(parts, data) : "";
-  return result;
-});
-
-// Wrap with data
-export const parserWithData = withData(interpolator);
