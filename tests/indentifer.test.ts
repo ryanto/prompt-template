@@ -20,5 +20,6 @@ test("reserved word", () => {
 
   expect(run.isError).toBe(true);
   invariant(run.isError);
-  expect(run.error).toBe("'if' is a reserved word");
+
+  expect(run.error).toBe("Reserved word {{if}} cannot be used as a variable");
 });

@@ -47,6 +47,19 @@ describe("text and variables", () => {
     expect(run.output).toBe("hi John Doe!");
   });
 
+  test("reserved word", () => {
+    const input = "{{end}}";
+    const data = {};
+    const run = safeRun(input, data);
+
+    expect(run.isError).toBe(true);
+    invariant(run.isError);
+
+    expect(run.error).toBe(
+      "Reserved word {{end}} cannot be used as a variable",
+    );
+  });
+
   test("missing placeholder", () => {
     const input = "hi {{first}} {{middle}} {{last}}!";
     const data = { first: "John", last: "Doe" };
@@ -82,6 +95,17 @@ describe("if statements", () => {
     expect(run.output).toBe("the condition is set");
   });
 
+  test("if statement with string", () => {
+    const input = "{{if name}}the name is {{name}}{{end}}";
+    const data = { name: "bob" };
+    const run = safeRun(input, data);
+
+    expect(run.isError).toBe(false);
+    invariant(!run.isError);
+
+    expect(run.output).toBe("the name is bob");
+  });
+
   test("if statement that evaluate to false", () => {
     const input = "{{if c}}the condition is set{{end}}";
     const data = { c: false };
@@ -93,19 +117,14 @@ describe("if statements", () => {
     expect(run.output).toBe("");
   });
 
-  // TODO: HERE
-  test.todo("missing data", () => {
+  test("missing data", () => {
     const input = "{{if c}}the condition is set{{end}}";
     const data = {};
     const run = safeRun(input, data);
-
-    console.log(run);
 
     expect(run.isError).toBe(true);
     invariant(run.isError);
 
     expect(run.error).toBe('Missing value for "{{c}}"');
   });
-
-  test.todo("floating end", () => {});
 });

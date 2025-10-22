@@ -3,7 +3,6 @@ import {
   endOfInput,
   everyCharUntil,
   lookAhead,
-  many,
   whitespace,
   sequenceOf,
   str,
@@ -13,12 +12,20 @@ import {
   recursiveParser,
   Parser,
 } from "arcsecond";
+import invariant from "tiny-invariant";
 
 type Identifier = {
   type: "identifier";
   name: string;
   index: number;
 };
+
+// TODO: Escaped {{ }}
+// TODO: Typed template based on identifiers
+// TODO: Dot paths
+// TODO: Function calls
+// TODO: Function composition
+// TODO: Async functions
 
 // TODO: Update Expression to be Idnetifier | BinaryExpression
 // In the future BinaryExpression will be (and a b) type statements
@@ -60,7 +67,7 @@ export const identifierN = sequenceOf([
   .map(([h, t]) => h + t)
   .chain<string>((name) =>
     name && RESERVED.has(name)
-      ? fail(`'${name}' is a reserved word`)
+      ? fail(`Reserved word {{${name}}} cannot be used as a variable`)
       : succeedWith(name),
   )
   .mapFromData<Identifier>(({ result, index }) => ({
@@ -77,7 +84,7 @@ export const interpolationN = open.chain(() =>
   sequenceOf([
     identifierN,
     close.errorMap(() => "Unclosed interpolation"),
-  ]).mapFromData<Interpolation>(({ result: [identifier] }) => ({
+  ]).map<Interpolation>(([identifier]) => ({
     type: "interpolation",
     index: identifier.index - 2,
     expression: identifier,
@@ -100,40 +107,75 @@ export const textN = everyCharUntil(choice([lookAhead(open), endOfInput]))
 const ifBeginTokens = [open, str("if"), ws];
 const ifBeginP = sequenceOf(ifBeginTokens);
 
-const ifConditionP1 = sequenceOf([
+const ifConditionP = sequenceOf([
   ...ifBeginTokens,
   expressionN.errorMap(() => "Missing or invalid if expression"),
   close.errorMap(() => "Unclosed if"),
 ]).map<Expression>(([, , , expression]) => expression);
 
-const endBeginTokens = [open, str("end")];
-const endP = sequenceOf([...endBeginTokens, close]);
+const elseP = sequenceOf([open, str("else"), close]);
+const endP = sequenceOf([open, str("end"), close]);
 
-const bodyN: Parser<Node> = recursiveParser(() =>
-  choice([
-    lookAhead(endP).chain(() => fail("Unexpected end")),
-    lookAhead(ifBeginP).chain(() => ifBlockN),
-    lookAhead(open).chain(() => interpolationN),
-    textN,
-  ]),
-);
+// useful recursive parser combinator that bubbles up an error if
+// there is one
+// const manyUntil = <T, E>(p: Parser<T>, eP: Parser<E>): Parser<T[]> =>
+//   recursiveParser(() =>
+//     choice([
+//       lookAhead(eP).map(() => []),
+//       sequenceOf([p, manyUntil(p, eP)]).map(([x, xs]) => [x, ...xs]),
+//     ]),
+//   );
 
-export const ifBlockN = ifConditionP1.chain((expression) => {
-  if (!expression) return fail("Missing or invalid if expression");
+export const ifElseN = ifConditionP.chain((expression) => {
+  invariant(expression, "missing expression");
 
-  return many(bodyN).chain((consequent) =>
-    endP
-      .errorMap(() => "Missing end tag after if block")
-      .map<Conditional>(() => ({
+  const index = expression.index - 5; // 5 chars for {{if\s
+
+  const consequentN: Parser<Node[]> = recursiveParser(() =>
+    choice([
+      endOfInput.chain(() => fail("Missing {{end}} after if block")),
+      lookAhead(choice([elseP, endP])).map(() => []),
+      sequenceOf([bodyN, consequentN]).map(([node, rest]) => [node, ...rest]),
+    ]),
+  );
+
+  const alternateN: Parser<Node[]> = recursiveParser(() =>
+    choice([
+      endOfInput.chain(() => fail("Missing {{end}} after if/else block")),
+      elseP.chain(() => fail("Encountered second {{else}} in if block")),
+      lookAhead(endP).map(() => []),
+      sequenceOf([bodyN, alternateN]).map(([node, rest]) => [node, ...rest]),
+    ]),
+  );
+
+  return consequentN.chain((consequent) =>
+    choice([
+      endP.map<Conditional>(() => ({
         type: "conditional",
-        index: expression.index - 5, // 5 characters before the expression, -> {{if\s
         condition: expression,
+        index,
         consequent: consequent ?? [],
       })),
+      sequenceOf([elseP, alternateN, endP]).map<Conditional>(
+        ([, alternate]) => ({
+          type: "conditional",
+          condition: expression,
+          index,
+          consequent: consequent ?? [],
+          alternate,
+        }),
+      ),
+    ]),
   );
 });
 
-export const templateParser: Parser<Node[]> = recursiveParser(() =>
+const bodyN = choice([
+  lookAhead(ifBeginP).chain(() => ifElseN),
+  lookAhead(open).chain(() => interpolationN),
+  textN,
+]);
+
+const templateParser: Parser<Node[]> = recursiveParser(() =>
   choice([
     endOfInput.map(() => []),
     sequenceOf([bodyN, templateParser]).map(([first, rest]) => [
@@ -257,6 +299,10 @@ const processNodes = (nodes: Node[], data: Data): string => {
         return getValue(data, key);
       } else if (part.type === "conditional") {
         const key = part.condition.name;
+        if (!hasKey(data, key)) {
+          throw new RuntimeError(`Missing value for "{{${key}}}"`, part.index);
+        }
+
         const conditionValue = getValue(data, key);
         if (conditionValue) {
           return processNodes(part.consequent, data);
